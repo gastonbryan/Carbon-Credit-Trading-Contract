@@ -19,6 +19,12 @@ A comprehensive smart contract for carbon credit issuance, trading, and retireme
 - **Batch Operations**: Transfer or retire multiple credits efficiently
 - **Balance Tracking**: Real-time user credit balances
 
+### 💎 Staking & Rewards
+- **Credit Staking**: Lock credits to earn STX rewards
+- **Tiered Rewards**: Higher rates for longer lock periods (2%, 5%, 10% APY)
+- **Flexible Terms**: Choose lock periods from 1 block to 1 year+
+- **Reward Claims**: Claim accumulated rewards anytime
+
 ### 📊 Analytics & Reporting
 - **Project Statistics**: Total credits issued per project
 - **Contract Metrics**: System-wide issuance and retirement data
@@ -59,6 +65,21 @@ clarinet deploy --testnet
 (contract-call? .carbon-credit-trading-contract retire-credits u1)
 ```
 
+#### Stake Credits (6 months lock for 5% APY)
+```clarity
+(contract-call? .carbon-credit-trading-contract stake-credits u1 u26280)
+```
+
+#### Unstake Credits & Claim Rewards
+```clarity
+(contract-call? .carbon-credit-trading-contract unstake-credits u1)
+```
+
+#### Claim Staking Rewards Only
+```clarity
+(contract-call? .carbon-credit-trading-contract claim-staking-rewards u1)
+```
+
 ## 📋 Contract Functions
 
 ### 🔐 Admin Functions
@@ -77,12 +98,21 @@ clarinet deploy --testnet
 - `cancel-listing` - Remove listing
 - `buy-credits` - Purchase listed credits
 
+### 💎 Staking Functions
+- `stake-credits` - Lock credits for rewards
+- `unstake-credits` - Unlock and claim rewards
+- `claim-staking-rewards` - Claim rewards only
+
 ### 📊 Read-Only Functions
 - `get-credit-info` - Get credit details
 - `get-user-balance` - Check user's total credits
 - `get-project-total` - Total credits for project
 - `get-contract-stats` - System-wide statistics
 - `is-credit-available` - Check if credit is active
+- `get-stake-info` - Get staking details
+- `get-user-stake-balance` - Check staked credits
+- `get-staking-rewards` - Calculate pending rewards
+- `is-stake-unlocked` - Check if stake can be withdrawn
 
 ## 🔍 Error Codes
 
@@ -98,6 +128,9 @@ clarinet deploy --testnet
 | u107 | Listing not found |
 | u108 | Cannot buy own listing |
 | u109 | Listing expired |
+| u110 | Stake not found |
+| u111 | Stake still locked |
+| u112 | Insufficient stake balance |
 
 ## 🧪 Testing
 

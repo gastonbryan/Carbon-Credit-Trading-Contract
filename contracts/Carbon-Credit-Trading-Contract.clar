@@ -9,6 +9,9 @@
 (define-constant err-listing-not-found (err u107))
 (define-constant err-cannot-buy-own-listing (err u108))
 (define-constant err-listing-expired (err u109))
+(define-constant err-stake-not-found (err u110))
+(define-constant err-stake-locked (err u111))
+(define-constant err-insufficient-stake-balance (err u112))
 
 (define-map authorized-issuers
     principal
@@ -44,11 +47,28 @@
         active: bool,
     }
 )
+(define-map credit-stakes
+    uint
+    {
+        staker: principal,
+        credit-id: uint,
+        amount: uint,
+        staked-at: uint,
+        lock-period: uint,
+        reward-rate: uint,
+    }
+)
+(define-map user-stake-balances
+    principal
+    uint
+)
 
 (define-data-var next-credit-id uint u1)
 (define-data-var next-listing-id uint u1)
+(define-data-var next-stake-id uint u1)
 (define-data-var total-credits-issued uint u0)
 (define-data-var total-credits-retired uint u0)
+(define-data-var total-credits-staked uint u0)
 
 (define-public (authorize-issuer (issuer principal))
     (begin
@@ -222,6 +242,101 @@
     (ok (map retire-credits credit-ids))
 )
 
+(define-public (stake-credits
+        (credit-id uint)
+        (lock-period uint)
+    )
+    (let (
+            (credit (unwrap! (map-get? carbon-credits credit-id) err-credit-not-found))
+            (stake-id (var-get next-stake-id))
+            (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+            (stake-balance (default-to u0 (map-get? user-stake-balances tx-sender)))
+            (reward-rate (calculate-reward-rate lock-period))
+        )
+        (asserts! (is-eq (get owner credit) tx-sender) err-not-authorized)
+        (asserts! (not (get retired credit)) err-credit-retired)
+        (asserts! (>= user-balance (get amount credit)) err-insufficient-balance)
+        (asserts! (> lock-period u0) err-invalid-amount)
+        (map-set credit-stakes stake-id {
+            staker: tx-sender,
+            credit-id: credit-id,
+            amount: (get amount credit),
+            staked-at: stacks-block-height,
+            lock-period: lock-period,
+            reward-rate: reward-rate,
+        })
+        (map-set user-balances tx-sender (- user-balance (get amount credit)))
+        (map-set user-stake-balances tx-sender
+            (+ stake-balance (get amount credit))
+        )
+        (var-set next-stake-id (+ stake-id u1))
+        (var-set total-credits-staked
+            (+ (var-get total-credits-staked) (get amount credit))
+        )
+        (ok stake-id)
+    )
+)
+
+(define-public (unstake-credits (stake-id uint))
+    (let (
+            (stake (unwrap! (map-get? credit-stakes stake-id) err-stake-not-found))
+            (unlock-height (+ (get staked-at stake) (get lock-period stake)))
+            (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+            (stake-balance (default-to u0 (map-get? user-stake-balances tx-sender)))
+            (rewards (calculate-staking-rewards stake-id))
+        )
+        (asserts! (is-eq (get staker stake) tx-sender) err-not-authorized)
+        (asserts! (>= stacks-block-height unlock-height) err-stake-locked)
+        (asserts! (>= stake-balance (get amount stake))
+            err-insufficient-stake-balance
+        )
+        (try! (as-contract (stx-transfer? rewards tx-sender tx-sender)))
+        (map-delete credit-stakes stake-id)
+        (map-set user-balances tx-sender (+ user-balance (get amount stake)))
+        (map-set user-stake-balances tx-sender
+            (- stake-balance (get amount stake))
+        )
+        (var-set total-credits-staked
+            (- (var-get total-credits-staked) (get amount stake))
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-staking-rewards (stake-id uint))
+    (let (
+            (stake (unwrap! (map-get? credit-stakes stake-id) err-stake-not-found))
+            (rewards (calculate-staking-rewards stake-id))
+        )
+        (asserts! (is-eq (get staker stake) tx-sender) err-not-authorized)
+        (asserts! (> rewards u0) err-invalid-amount)
+        (try! (as-contract (stx-transfer? rewards tx-sender tx-sender)))
+        (ok rewards)
+    )
+)
+
+(define-private (calculate-reward-rate (lock-period uint))
+    (if (>= lock-period u52560)
+        u10
+        (if (>= lock-period u26280)
+            u5
+            u2
+        )
+    )
+)
+
+(define-private (calculate-staking-rewards (stake-id uint))
+    (match (map-get? credit-stakes stake-id)
+        stake (let (
+                (time-staked (- stacks-block-height (get staked-at stake)))
+                (reward-per-block (/ (* (get amount stake) (get reward-rate stake)) u10000))
+            )
+            (* time-staked reward-per-block)
+        )
+        u0
+    )
+)
+
 (define-read-only (get-credit-info (credit-id uint))
     (map-get? carbon-credits credit-id)
 )
@@ -242,10 +357,31 @@
     {
         total-issued: (var-get total-credits-issued),
         total-retired: (var-get total-credits-retired),
+        total-staked: (var-get total-credits-staked),
         total-active: (- (var-get total-credits-issued) (var-get total-credits-retired)),
         next-credit-id: (var-get next-credit-id),
         next-listing-id: (var-get next-listing-id),
+        next-stake-id: (var-get next-stake-id),
     }
+)
+
+(define-read-only (get-stake-info (stake-id uint))
+    (map-get? credit-stakes stake-id)
+)
+
+(define-read-only (get-user-stake-balance (user principal))
+    (default-to u0 (map-get? user-stake-balances user))
+)
+
+(define-read-only (get-staking-rewards (stake-id uint))
+    (calculate-staking-rewards stake-id)
+)
+
+(define-read-only (is-stake-unlocked (stake-id uint))
+    (match (map-get? credit-stakes stake-id)
+        stake (>= stacks-block-height (+ (get staked-at stake) (get lock-period stake)))
+        false
+    )
 )
 
 (define-read-only (is-credit-available (credit-id uint))
