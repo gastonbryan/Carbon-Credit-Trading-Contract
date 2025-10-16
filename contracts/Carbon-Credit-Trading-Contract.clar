@@ -12,6 +12,12 @@
 (define-constant err-stake-not-found (err u110))
 (define-constant err-stake-locked (err u111))
 (define-constant err-insufficient-stake-balance (err u112))
+(define-constant err-not-authorized-auditor (err u113))
+(define-constant err-audit-not-found (err u114))
+(define-constant err-audit-already-completed (err u115))
+(define-constant err-invalid-audit-status (err u116))
+(define-constant err-certificate-not-found (err u117))
+(define-constant err-credit-already-audited (err u118))
 
 (define-map authorized-issuers
     principal
@@ -63,12 +69,54 @@
     uint
 )
 
+;; === AUDITING SYSTEM DATA STRUCTURES ===
+(define-map authorized-auditors
+    principal
+    {
+        authorized-at: uint,
+        certifications: (list 10 (string-ascii 32)),
+        total-audits: uint,
+        reputation-score: uint,
+    }
+)
+
+(define-map audit-records
+    uint
+    {
+        auditor: principal,
+        credit-id: uint,
+        initiated-at: uint,
+        completed-at: (optional uint),
+        status: (string-ascii 16),
+        findings: (string-ascii 256),
+        verification-score: uint,
+        compliance-level: (string-ascii 16),
+    }
+)
+
+(define-map compliance-certificates
+    uint
+    {
+        credit-id: uint,
+        auditor: principal,
+        issued-at: uint,
+        expiry-date: uint,
+        certificate-hash: (string-ascii 64),
+        compliance-grade: (string-ascii 2),
+        verified: bool,
+    }
+)
+
 (define-data-var next-credit-id uint u1)
 (define-data-var next-listing-id uint u1)
 (define-data-var next-stake-id uint u1)
 (define-data-var total-credits-issued uint u0)
 (define-data-var total-credits-retired uint u0)
 (define-data-var total-credits-staked uint u0)
+(define-data-var next-audit-id uint u1)
+(define-data-var next-certificate-id uint u1)
+(define-data-var total-audits-completed uint u0)
+(define-data-var total-certificates-issued uint u0)
 
 (define-public (authorize-issuer (issuer principal))
     (begin
@@ -362,6 +410,10 @@
         next-credit-id: (var-get next-credit-id),
         next-listing-id: (var-get next-listing-id),
         next-stake-id: (var-get next-stake-id),
+        total-audits-completed: (var-get total-audits-completed),
+        total-certificates-issued: (var-get total-certificates-issued),
+        next-audit-id: (var-get next-audit-id),
+        next-certificate-id: (var-get next-certificate-id),
     }
 )
 
@@ -486,6 +538,283 @@
         (> (get credit-id credit) u0)
         (not (get retired credit))
     )
+)
+
+;; === AUDITING SYSTEM FUNCTIONS ===
+
+(define-public (authorize-auditor 
+        (auditor principal)
+        (certifications (list 10 (string-ascii 32)))
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set authorized-auditors auditor {
+            authorized-at: stacks-block-height,
+            certifications: certifications,
+            total-audits: u0,
+            reputation-score: u100,
+        })
+        (ok true)
+    )
+)
+
+(define-public (revoke-auditor (auditor principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-delete authorized-auditors auditor))
+    )
+)
+
+(define-read-only (is-authorized-auditor (auditor principal))
+    (is-some (map-get? authorized-auditors auditor))
+)
+
+(define-public (initiate-audit (credit-id uint))
+    (let (
+            (credit (unwrap! (map-get? carbon-credits credit-id) err-credit-not-found))
+            (audit-id (var-get next-audit-id))
+        )
+        (asserts! (is-authorized-auditor tx-sender) err-not-authorized-auditor)
+        (asserts! (not (get retired credit)) err-credit-retired)
+        (asserts! (is-none (get-active-audit-for-credit credit-id)) err-credit-already-audited)
+        
+        (map-set audit-records audit-id {
+            auditor: tx-sender,
+            credit-id: credit-id,
+            initiated-at: stacks-block-height,
+            completed-at: none,
+            status: "in-progress",
+            findings: "",
+            verification-score: u0,
+            compliance-level: "",
+        })
+        (var-set next-audit-id (+ audit-id u1))
+        (ok audit-id)
+    )
+)
+
+(define-public (complete-audit
+        (audit-id uint)
+        (findings (string-ascii 256))
+        (verification-score uint)
+        (compliance-level (string-ascii 16))
+    )
+    (let (
+            (audit (unwrap! (map-get? audit-records audit-id) err-audit-not-found))
+            (auditor-info (unwrap! (map-get? authorized-auditors tx-sender) err-not-authorized-auditor))
+        )
+        (asserts! (is-eq (get auditor audit) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status audit) "in-progress") err-audit-already-completed)
+        (asserts! (<= verification-score u100) err-invalid-audit-status)
+        
+        (map-set audit-records audit-id (merge audit {
+            completed-at: (some stacks-block-height),
+            status: "completed",
+            findings: findings,
+            verification-score: verification-score,
+            compliance-level: compliance-level,
+        }))
+        
+        ;; Update auditor stats
+        (map-set authorized-auditors tx-sender (merge auditor-info {
+            total-audits: (+ (get total-audits auditor-info) u1),
+            reputation-score: (calculate-new-reputation 
+                (get reputation-score auditor-info) 
+                verification-score
+            ),
+        }))
+        
+        (var-set total-audits-completed (+ (var-get total-audits-completed) u1))
+        (ok true)
+    )
+)
+
+(define-public (issue-compliance-certificate
+        (audit-id uint)
+        (expiry-blocks uint)
+        (certificate-hash (string-ascii 64))
+        (compliance-grade (string-ascii 2))
+    )
+    (let (
+            (audit (unwrap! (map-get? audit-records audit-id) err-audit-not-found))
+            (certificate-id (var-get next-certificate-id))
+            (expiry-date (+ stacks-block-height expiry-blocks))
+        )
+        (asserts! (is-eq (get auditor audit) tx-sender) err-not-authorized)
+        (asserts! (is-eq (get status audit) "completed") err-invalid-audit-status)
+        (asserts! (>= (get verification-score audit) u70) err-invalid-audit-status)
+        
+        (map-set compliance-certificates certificate-id {
+            credit-id: (get credit-id audit),
+            auditor: tx-sender,
+            issued-at: stacks-block-height,
+            expiry-date: expiry-date,
+            certificate-hash: certificate-hash,
+            compliance-grade: compliance-grade,
+            verified: true,
+        })
+        
+        (var-set next-certificate-id (+ certificate-id u1))
+        (var-set total-certificates-issued (+ (var-get total-certificates-issued) u1))
+        (ok certificate-id)
+    )
+)
+
+(define-public (revoke-certificate (certificate-id uint))
+    (let (
+            (certificate (unwrap! (map-get? compliance-certificates certificate-id) err-certificate-not-found))
+        )
+        (asserts! (or 
+            (is-eq tx-sender contract-owner) 
+            (is-eq tx-sender (get auditor certificate))
+        ) err-not-authorized)
+        
+        (map-set compliance-certificates certificate-id 
+            (merge certificate { verified: false })
+        )
+        (ok true)
+    )
+)
+
+;; === AUDITING READ-ONLY FUNCTIONS ===
+
+(define-read-only (get-auditor-info (auditor principal))
+    (map-get? authorized-auditors auditor)
+)
+
+(define-read-only (get-audit-record (audit-id uint))
+    (map-get? audit-records audit-id)
+)
+
+(define-read-only (get-compliance-certificate (certificate-id uint))
+    (map-get? compliance-certificates certificate-id)
+)
+
+(define-read-only (get-active-audit-for-credit (credit-id uint))
+    (let (
+            (audit-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+        )
+        (find-active-audit-for-credit audit-ids credit-id)
+    )
+)
+
+(define-read-only (is-certificate-valid (certificate-id uint))
+    (match (map-get? compliance-certificates certificate-id)
+        certificate (and 
+            (get verified certificate)
+            (> (get expiry-date certificate) stacks-block-height)
+        )
+        false
+    )
+)
+
+(define-read-only (get-audit-statistics)
+    {
+        total-audits-completed: (var-get total-audits-completed),
+        total-certificates-issued: (var-get total-certificates-issued),
+        next-audit-id: (var-get next-audit-id),
+        next-certificate-id: (var-get next-certificate-id),
+    }
+)
+
+(define-read-only (get-credit-audit-history (credit-id uint))
+    (list 
+        (get-audit-with-id u1 credit-id)
+        (get-audit-with-id u2 credit-id)
+        (get-audit-with-id u3 credit-id)
+        (get-audit-with-id u4 credit-id)
+        (get-audit-with-id u5 credit-id)
+    )
+)
+
+;; === PRIVATE HELPER FUNCTIONS ===
+
+(define-private (calculate-new-reputation (current-score uint) (verification-score uint))
+    (let (
+            (weighted-score (/ (+ (* current-score u4) verification-score) u5))
+        )
+        (if (> weighted-score u100) u100 weighted-score)
+    )
+)
+
+(define-private (find-active-audit-for-credit (audit-ids (list 10 uint)) (target-credit-id uint))
+    (let (
+            (active-audits (filter is-active-audit-for-target 
+                (map get-audit-with-target-id 
+                    (map combine-ids audit-ids (list target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id))
+                )
+            ))
+        )
+        (if (> (len active-audits) u0)
+            (some (get audit-id (unwrap-panic (element-at? active-audits u0))))
+            none
+        )
+    )
+)
+
+(define-private (combine-ids (audit-id uint) (credit-id uint))
+    { audit-id: audit-id, credit-id: credit-id }
+)
+
+(define-private (get-audit-with-target-id (ids { audit-id: uint, credit-id: uint }))
+    (match (map-get? audit-records (get audit-id ids))
+        audit (merge audit { audit-id: (get audit-id ids), target-credit-id: (get credit-id ids) })
+        {
+            audit-id: u0,
+            target-credit-id: (get credit-id ids),
+            auditor: contract-owner,
+            credit-id: u0,
+            initiated-at: u0,
+            completed-at: none,
+            status: "",
+            findings: "",
+            verification-score: u0,
+            compliance-level: "",
+        }
+    )
+)
+
+(define-private (is-active-audit-for-target (audit {
+    audit-id: uint,
+    target-credit-id: uint,
+    auditor: principal,
+    credit-id: uint,
+    initiated-at: uint,
+    completed-at: (optional uint),
+    status: (string-ascii 16),
+    findings: (string-ascii 256),
+    verification-score: uint,
+    compliance-level: (string-ascii 16),
+}))
+    (and
+        (> (get audit-id audit) u0)
+        (is-eq (get credit-id audit) (get target-credit-id audit))
+        (is-eq (get status audit) "in-progress")
+    )
+)
+
+(define-private (get-audit-with-id (audit-id uint) (target-credit-id uint))
+    (match (map-get? audit-records audit-id)
+        audit (if (is-eq (get credit-id audit) target-credit-id)
+            (some (merge audit { audit-id: audit-id }))
+            none
+        )
+        none
+    )
+)
+
+(define-private (is-credit-audit (audit-option (optional {
+    audit-id: uint,
+    auditor: principal,
+    credit-id: uint,
+    initiated-at: uint,
+    completed-at: (optional uint),
+    status: (string-ascii 16),
+    findings: (string-ascii 256),
+    verification-score: uint,
+    compliance-level: (string-ascii 16),
+})))
+    (is-some audit-option)
 )
 
 (map-set authorized-issuers contract-owner true)
