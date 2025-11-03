@@ -18,6 +18,7 @@
 (define-constant err-invalid-audit-status (err u116))
 (define-constant err-certificate-not-found (err u117))
 (define-constant err-credit-already-audited (err u118))
+(define-constant err-invalid-royalty (err u119))
 
 (define-map authorized-issuers
     principal
@@ -117,11 +118,36 @@
 (define-data-var next-certificate-id uint u1)
 (define-data-var total-audits-completed uint u0)
 (define-data-var total-certificates-issued uint u0)
+(define-data-var royalty-admin principal contract-owner)
+(define-data-var royalty-bps uint u0)
+(define-data-var royalty-recipient principal contract-owner)
 
 (define-public (authorize-issuer (issuer principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (ok (map-set authorized-issuers issuer true))
+    )
+)
+
+(define-public (set-royalty-bps (new-bps uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get royalty-admin)) err-owner-only)
+        (asserts! (<= new-bps u10000) err-invalid-royalty)
+        (ok (var-set royalty-bps new-bps))
+    )
+)
+
+(define-public (set-royalty-recipient (new-recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get royalty-admin)) err-owner-only)
+        (ok (var-set royalty-recipient new-recipient))
+    )
+)
+
+(define-public (set-royalty-admin (new-admin principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get royalty-admin)) err-owner-only)
+        (ok (var-set royalty-admin new-admin))
     )
 )
 
@@ -272,6 +298,44 @@
     )
 )
 
+(define-public (buy-credits-with-royalty (listing-id uint))
+    (let (
+            (listing (unwrap! (map-get? marketplace-listings listing-id)
+                err-listing-not-found
+            ))
+            (credit-id (get credit-id listing))
+            (credit (unwrap! (map-get? carbon-credits credit-id) err-credit-not-found))
+            (buyer-balance (default-to u0 (map-get? user-balances tx-sender)))
+            (seller-balance (default-to u0 (map-get? user-balances (get seller listing))))
+            (price (get price listing))
+            (royalty-amount (calculate-royalty price))
+            (seller-amount (- price royalty-amount))
+        )
+        (asserts! (get active listing) err-listing-not-found)
+        (asserts! (<= stacks-block-height (get expires-at listing))
+            err-listing-expired
+        )
+        (asserts! (not (is-eq tx-sender (get seller listing)))
+            err-cannot-buy-own-listing
+        )
+        (asserts! (not (get retired credit)) err-credit-retired)
+        (try! (stx-transfer? seller-amount tx-sender (get seller listing)))
+        (if (> royalty-amount u0)
+            (try! (stx-transfer? royalty-amount tx-sender (var-get royalty-recipient)))
+            true
+        )
+        (map-set carbon-credits credit-id (merge credit { owner: tx-sender }))
+        (map-set user-balances tx-sender (+ buyer-balance (get amount credit)))
+        (map-set user-balances (get seller listing)
+            (- seller-balance (get amount credit))
+        )
+        (map-set marketplace-listings listing-id
+            (merge listing { active: false })
+        )
+        (ok credit-id)
+    )
+)
+
 (define-public (batch-transfer (transfers (list 50 {
     credit-id: uint,
     recipient: principal,
@@ -391,6 +455,22 @@
 
 (define-read-only (get-user-balance (user principal))
     (default-to u0 (map-get? user-balances user))
+)
+
+(define-read-only (get-royalty-admin)
+    (var-get royalty-admin)
+)
+
+(define-read-only (get-royalty-bps)
+    (var-get royalty-bps)
+)
+
+(define-read-only (get-royalty-recipient)
+    (var-get royalty-recipient)
+)
+
+(define-read-only (calculate-royalty (amount uint))
+    (/ (* amount (var-get royalty-bps)) u10000)
 )
 
 (define-read-only (get-project-total (project-id (string-ascii 64)))
@@ -542,7 +622,7 @@
 
 ;; === AUDITING SYSTEM FUNCTIONS ===
 
-(define-public (authorize-auditor 
+(define-public (authorize-auditor
         (auditor principal)
         (certifications (list 10 (string-ascii 32)))
     )
@@ -576,8 +656,10 @@
         )
         (asserts! (is-authorized-auditor tx-sender) err-not-authorized-auditor)
         (asserts! (not (get retired credit)) err-credit-retired)
-        (asserts! (is-none (get-active-audit-for-credit credit-id)) err-credit-already-audited)
-        
+        (asserts! (is-none (get-active-audit-for-credit credit-id))
+            err-credit-already-audited
+        )
+
         (map-set audit-records audit-id {
             auditor: tx-sender,
             credit-id: credit-id,
@@ -601,29 +683,36 @@
     )
     (let (
             (audit (unwrap! (map-get? audit-records audit-id) err-audit-not-found))
-            (auditor-info (unwrap! (map-get? authorized-auditors tx-sender) err-not-authorized-auditor))
+            (auditor-info (unwrap! (map-get? authorized-auditors tx-sender)
+                err-not-authorized-auditor
+            ))
         )
         (asserts! (is-eq (get auditor audit) tx-sender) err-not-authorized)
-        (asserts! (is-eq (get status audit) "in-progress") err-audit-already-completed)
+        (asserts! (is-eq (get status audit) "in-progress")
+            err-audit-already-completed
+        )
         (asserts! (<= verification-score u100) err-invalid-audit-status)
-        
-        (map-set audit-records audit-id (merge audit {
-            completed-at: (some stacks-block-height),
-            status: "completed",
-            findings: findings,
-            verification-score: verification-score,
-            compliance-level: compliance-level,
-        }))
-        
+
+        (map-set audit-records audit-id
+            (merge audit {
+                completed-at: (some stacks-block-height),
+                status: "completed",
+                findings: findings,
+                verification-score: verification-score,
+                compliance-level: compliance-level,
+            })
+        )
+
         ;; Update auditor stats
-        (map-set authorized-auditors tx-sender (merge auditor-info {
-            total-audits: (+ (get total-audits auditor-info) u1),
-            reputation-score: (calculate-new-reputation 
-                (get reputation-score auditor-info) 
-                verification-score
-            ),
-        }))
-        
+        (map-set authorized-auditors tx-sender
+            (merge auditor-info {
+                total-audits: (+ (get total-audits auditor-info) u1),
+                reputation-score: (calculate-new-reputation (get reputation-score auditor-info)
+                    verification-score
+                ),
+            })
+        )
+
         (var-set total-audits-completed (+ (var-get total-audits-completed) u1))
         (ok true)
     )
@@ -642,8 +731,10 @@
         )
         (asserts! (is-eq (get auditor audit) tx-sender) err-not-authorized)
         (asserts! (is-eq (get status audit) "completed") err-invalid-audit-status)
-        (asserts! (>= (get verification-score audit) u70) err-invalid-audit-status)
-        
+        (asserts! (>= (get verification-score audit) u70)
+            err-invalid-audit-status
+        )
+
         (map-set compliance-certificates certificate-id {
             credit-id: (get credit-id audit),
             auditor: tx-sender,
@@ -653,23 +744,28 @@
             compliance-grade: compliance-grade,
             verified: true,
         })
-        
+
         (var-set next-certificate-id (+ certificate-id u1))
-        (var-set total-certificates-issued (+ (var-get total-certificates-issued) u1))
+        (var-set total-certificates-issued
+            (+ (var-get total-certificates-issued) u1)
+        )
         (ok certificate-id)
     )
 )
 
 (define-public (revoke-certificate (certificate-id uint))
-    (let (
-            (certificate (unwrap! (map-get? compliance-certificates certificate-id) err-certificate-not-found))
+    (let ((certificate (unwrap! (map-get? compliance-certificates certificate-id)
+            err-certificate-not-found
+        )))
+        (asserts!
+            (or
+                (is-eq tx-sender contract-owner)
+                (is-eq tx-sender (get auditor certificate))
+            )
+            err-not-authorized
         )
-        (asserts! (or 
-            (is-eq tx-sender contract-owner) 
-            (is-eq tx-sender (get auditor certificate))
-        ) err-not-authorized)
-        
-        (map-set compliance-certificates certificate-id 
+
+        (map-set compliance-certificates certificate-id
             (merge certificate { verified: false })
         )
         (ok true)
@@ -691,16 +787,14 @@
 )
 
 (define-read-only (get-active-audit-for-credit (credit-id uint))
-    (let (
-            (audit-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
-        )
+    (let ((audit-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)))
         (find-active-audit-for-credit audit-ids credit-id)
     )
 )
 
 (define-read-only (is-certificate-valid (certificate-id uint))
     (match (map-get? compliance-certificates certificate-id)
-        certificate (and 
+        certificate (and
             (get verified certificate)
             (> (get expiry-date certificate) stacks-block-height)
         )
@@ -718,7 +812,7 @@
 )
 
 (define-read-only (get-credit-audit-history (credit-id uint))
-    (list 
+    (list
         (get-audit-with-id u1 credit-id)
         (get-audit-with-id u2 credit-id)
         (get-audit-with-id u3 credit-id)
@@ -729,22 +823,31 @@
 
 ;; === PRIVATE HELPER FUNCTIONS ===
 
-(define-private (calculate-new-reputation (current-score uint) (verification-score uint))
-    (let (
-            (weighted-score (/ (+ (* current-score u4) verification-score) u5))
+(define-private (calculate-new-reputation
+        (current-score uint)
+        (verification-score uint)
+    )
+    (let ((weighted-score (/ (+ (* current-score u4) verification-score) u5)))
+        (if (> weighted-score u100)
+            u100
+            weighted-score
         )
-        (if (> weighted-score u100) u100 weighted-score)
     )
 )
 
-(define-private (find-active-audit-for-credit (audit-ids (list 10 uint)) (target-credit-id uint))
-    (let (
-            (active-audits (filter is-active-audit-for-target 
-                (map get-audit-with-target-id 
-                    (map combine-ids audit-ids (list target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id target-credit-id))
-                )
-            ))
-        )
+(define-private (find-active-audit-for-credit
+        (audit-ids (list 10 uint))
+        (target-credit-id uint)
+    )
+    (let ((active-audits (filter is-active-audit-for-target
+            (map get-audit-with-target-id
+                (map combine-ids audit-ids
+                    (list target-credit-id target-credit-id target-credit-id
+                        target-credit-id target-credit-id target-credit-id
+                        target-credit-id target-credit-id target-credit-id
+                        target-credit-id)
+                ))
+        )))
         (if (> (len active-audits) u0)
             (some (get audit-id (unwrap-panic (element-at? active-audits u0))))
             none
@@ -752,13 +855,25 @@
     )
 )
 
-(define-private (combine-ids (audit-id uint) (credit-id uint))
-    { audit-id: audit-id, credit-id: credit-id }
+(define-private (combine-ids
+        (audit-id uint)
+        (credit-id uint)
+    )
+    {
+        audit-id: audit-id,
+        credit-id: credit-id,
+    }
 )
 
-(define-private (get-audit-with-target-id (ids { audit-id: uint, credit-id: uint }))
+(define-private (get-audit-with-target-id (ids {
+    audit-id: uint,
+    credit-id: uint,
+}))
     (match (map-get? audit-records (get audit-id ids))
-        audit (merge audit { audit-id: (get audit-id ids), target-credit-id: (get credit-id ids) })
+        audit (merge audit {
+            audit-id: (get audit-id ids),
+            target-credit-id: (get credit-id ids),
+        })
         {
             audit-id: u0,
             target-credit-id: (get credit-id ids),
@@ -793,7 +908,10 @@
     )
 )
 
-(define-private (get-audit-with-id (audit-id uint) (target-credit-id uint))
+(define-private (get-audit-with-id
+        (audit-id uint)
+        (target-credit-id uint)
+    )
     (match (map-get? audit-records audit-id)
         audit (if (is-eq (get credit-id audit) target-credit-id)
             (some (merge audit { audit-id: audit-id }))
