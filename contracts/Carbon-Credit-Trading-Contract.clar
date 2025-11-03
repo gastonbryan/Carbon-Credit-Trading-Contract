@@ -842,12 +842,16 @@
     (let ((active-audits (filter is-active-audit-for-target
             (map get-audit-with-target-id
                 (map combine-ids audit-ids
-                    (list target-credit-id target-credit-id target-credit-id
-                        target-credit-id target-credit-id target-credit-id
-                        target-credit-id target-credit-id target-credit-id
-                        target-credit-id)
-                ))
-        )))
+                    (list
+                        target-credit-id                         target-credit-id
+                                                target-credit-id
+                        target-credit-id                         target-credit-id
+                                                target-credit-id
+                        target-credit-id                         target-credit-id
+                                                target-credit-id
+                        target-credit-id
+                    ))
+            ))))
         (if (> (len active-audits) u0)
             (some (get audit-id (unwrap-panic (element-at? active-audits u0))))
             none
